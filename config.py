@@ -1,6 +1,9 @@
 import os
 import tensorflow as tf
 
+from preprocess import prepro
+from trainer import train
+
 flags = tf.flags
 
 data_dir = "data"
@@ -27,17 +30,20 @@ flags.DEFINE_string("dev_file", dev_file, "")
 
 flags.DEFINE_string("train_record_file", train_record_file, "")
 flags.DEFINE_string("dev_record_file", dev_record_file, "")
+flags.DEFINE_integer("hidden_dim", 75, "size of hidden dim")
+flags.DEFINE_integer("grad_clip", 5, "global norm gradient clipping")
 
 
 def main(_):
     config = flags.FLAGS
     if config.mode == "train":
-        pass
+        train(config)
     elif config.mode == "preprocess":
-        pass
+        prepro(config)
     elif config.mode == "debug":
-        pass
-    elif config.mode == "test":
+        #TODO: set debug configuration
+        train(config)
+    elif config.mode == "evaluate":
         pass
 
 
