@@ -1,26 +1,35 @@
 import tensorflow as tf
 from layer import rnn, integration_flow, question_attention, fully_aware_attention
+from bilm import BidirectionalLanguageModel, weight_layers
+from keras.models import load_model
 
 
 class FlowQA(object):
 
     def __init__(self, config, iterator, word_mat=None, trainable=True):
         self.config = config
-        self.global_step = tf.get_variable("global_step", shape=[], dtype=tf.int32, initializer=tf.constant_initializer(0), trainable=False)
+        self.global_step = tf.get_variable("global_step", shape=[], dtype=tf.int32,
+                                           initializer=tf.constant_initializer(0), trainable=False)
         self.is_train = tf.get_variable("is_train", shape=[], dtype=tf.bool, trainable=False)
 
-        self.word_mat = tf.get_variable("word_mat", initializer=tf.constant(word_mat, dtype=tf.float32), trainable=False)
+        self.word_mat = tf.get_variable("word_mat",
+                                        initializer=tf.constant(word_mat, dtype=tf.float32), trainable=False)
 
-        self.context_idxs, self.questions_idxs, self.starts, self.ends, self.em = iterator.get_next()
+        self.context_idxs, self.questions_idxs, self.context_char_idxs, self.questions_char_idxs, \
+            self.starts, self.ends, self.em, = iterator.get_next()
+
         """
         context_idxs: (batch_size, para_limit)
         questions_idxs: (batch_size, turn_limit, ques_limit)
+        context_char_idxs: (batch_size, para_limit, 50)
+        questions_char_idxs: (batch_size, turn_limit, ques_limit, 50)
         starts: (batch_size, turn_limit, para_limit)
         ends: (batch_size, turn_limit, para_limit)
         em: (batch_size, turn_limit, para_limit)
+        
         """
 
-        batch_size = config.batch_size
+        self.batch_size = config.batch_size
 
         # TODO: create mask
         # self.context_mask = tf.cast(self.context_idxs, tf.bool)
@@ -43,16 +52,45 @@ class FlowQA(object):
     def ready(self):
         with tf.variable_scope("embedding"):
             # shape: (batch_size, para_limit, embedding_dim)
-            context_emb = tf.nn.embedding_lookup(self.word_mat, self.context_idxs)
+            context_glove = tf.nn.embedding_lookup(self.word_mat, self.context_idxs)
             # shape: (batch_size, turn_limit, ques_limit, embedding_dim)
-            questions_emb = tf.nn.embedding_lookup(self.word_mat, self.questions_idxs)
-            
+            questions_glove = tf.nn.embedding_lookup(self.word_mat, self.questions_idxs)
+
+            with tf.variable_scope("elmo"):
+                bilm = BidirectionalLanguageModel(self.config.options_file, self.config.weight_file)
+                # shape: (batch_size, 3, para_limit, 1024)
+                context_lm = bilm(self.context_char_idxs)
+                _questions_char_idxs = tf.reshape(self.questions_char_idxs, [batch_size*turn_limit, ques_limit, 50])
+                # shape: (batch_size*turn_limit, 3, ques_limit, 1024)
+                questions_lm = bilm(self.questions_char_idxs)
+
+                # shape: (batch_size, para_limit, 1024)
+                context_elmo = weight_layers("name", context_lm, l2_coef=0.0)
+                with tf.variable_scope("", reuse=True):
+                    # shape: (batch_size*turn_limit, ques_limit, 1024)
+                    questions_elmo = weight_layers("name", questions_lm, l2_coef=0.0)
+
+            # TODO: finish integrating elmo
+            pass
+
+            # TODO: integrating CoVe
+            pass
+            cove_model = load_model(self.config.cove_word_file)
+            context_cove = cove_model(context_glove)
+            _question_glove = tf.reshape(question_glove, [batch_size*turn_limit, ques_limit, embedding_dim])
+            questions_cove = cove_model(_questions_glove)
+
+
+            c = tf.concat([context_glove, context_cove, context_elmo], axis=-1)
+            q = tf.concat([questions_glove, questions_cove, questions_elmo], axis=-1)
+
+
         with tf.variable_scope("encoding"):
             # context encoding - attention on question
             # shape: (batch_size, turn_limit, para_limit, embedding_dim)
-            g = question_attention(context_emb, questions_emb)
+            g = question_attention(context_glove, questions_glove)
             em = tf.expand_dims(self.em, axis=-1)
-            c = tf.tile(tf.expand_dims(context_emb, axis=1), [1, turn_limit, 1, 1])
+            c = tf.tile(tf.expand_dims(c, axis=1), [1, turn_limit, 1, 1])
 
             # shape: (batch_size, turn_limit, para_limit, embedding_dim + 1 + embedding_dim = context_dim)
             c_0 = tf.concat([c, em, g], -1)
@@ -62,7 +100,7 @@ class FlowQA(object):
             ques_limit = None
 
             # shape: (batch_size*turn_limit, ques_limit, embedding_dim)
-            _q = tf.reshape(questions_emb, [batch_size*turn_limit, ques_limit, embedding_dim])
+            _q = tf.reshape(q, [batch_size*turn_limit, ques_limit, embedding_dim])
 
             bi_lstm = rnn(num_layers=2, bidirectional=True, num_units=config.hidden_dim,
                         batch_size=batch_size*turn_limit, input_size=input_size, is_train=self.is_train)
@@ -146,7 +184,8 @@ class FlowQA(object):
             # shape: (batch_size, turn_limit, concat_dim)
             p_fc = tf.layers.dense(p, concat_dim, use_bias=False)
             # shape: (batch_size, turn_limit)
-            no_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2), tf.expand_dims(p_fc, axis=-1)), axis=-1)
+            no_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2),
+                                             tf.expand_dims(p_fc, axis=-1)), axis=-1)
             no_probs = tf.nn.sigmoid(no_logits)
 
         with tf.name_scope("loss"):

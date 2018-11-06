@@ -229,9 +229,9 @@ class rnn:
         self.inits = []
         self.dropout_mask = []
         self.scope = type
-        if self.scope = "lstm":
+        if self.scope == "lstm":
             self.rnn_cell = tf.contrib.rnn.LSTMCell
-        else if self.scope = "gru":
+        elif self.scope == "gru":
             self.rnn_cell = tf.contrib.rnn.GRUCell
         else:
             self.rnn_cell = tf.contrib.rnn.RNNCell
@@ -301,9 +301,10 @@ class rnn:
 def question_attention(context, questions):
     """
     :context, (batch_size, para_limit, embedding_dim)
-    :question, (batch_size, turn_limit, ques_limit, embedding_dim)
+    :questions, (batch_size, turn_limit, ques_limit, embedding_dim)
     """
     # TODO:
+    batch_size = None
     para_limit = None
     ques_limit = None
     turn_limit = None
@@ -326,7 +327,7 @@ def question_attention(context, questions):
     # shape: (B, T, P, Q)
     probs = tf.transpose(probs, [0, 2, 1, 3])
     # shape: (B, T, P, E)
-    res = tf.matmul(probs, question)
+    res = tf.matmul(probs, questions)
     return res
 
 
@@ -337,6 +338,9 @@ def fully_aware_attention(context_how, questions_how, questions):
     :questions, (batch_size, turn_limit, ques_limit, embedding_dim)
     """
     k = None
+    batch_size = None
+    turn_limit = None
+    ques_limit = None
     # shape: (batch_size, turn_limit, para_limit, k)
     _context = tf.layers.dense(context_how, k, activation=tf.nn.relu, use_bias=False)
 
@@ -362,6 +366,7 @@ def integration_flow(context, num_units, batch_size, input_size, is_train):
     :context, (batch_size, turn_limit, para_limit, embedding_dim)
     """
     #TODO:
+    turn_limit = None
     para_limit = None
     embedding_dim = None
 
@@ -386,3 +391,18 @@ def integration_flow(context, num_units, batch_size, input_size, is_train):
 
     c_next = tf.concat([c_hat, f], axis=-1)
     return c_next
+
+
+def dropout(args, keep_prob, is_train, mode="recurrent"):
+    if keep_prob < 1.0:
+        noise_shape = None
+        scale = 1.0
+        shape = tf.shape(args)
+        if mode == "embedding":
+            noise_shape = [shape[0], 1]
+            scale = keep_prob
+        if mode == "recurrent" and len(args.get_shape().as_list()) == 3:
+            noise_shape = [shape[0], 1, shape[-1]]
+        args = tf.cond(is_train, lambda: tf.nn.dropout(
+            args, keep_prob, noise_shape=noise_shape) * scale, lambda: args)
+    return args
