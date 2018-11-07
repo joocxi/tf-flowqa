@@ -118,10 +118,8 @@ def get_embedding(counter, data_type, limit=-1, emb_file=None, size=None, vec_si
 
 def build_features(config, examples, data_type, out_file, word2idx_dict, is_test=False):
 
-    para_limit = config.test_para_limit if is_test else config.para_limit
-    ques_limit = config.test_ques_limit if is_test else config.ques_limit
-
-    # TODO:
+    para_limit = config.para_limit
+    ques_limit = config.ques_limit
     turn_limit = config.turn_limit
 
     def filter_func(example):
@@ -134,7 +132,7 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
     meta = {}
 
     max_char_length = config.max_char_length
-    batcher = Batcher(config.lm_vocab_file, max_char_length)
+    batcher = Batcher(config.elmo_vocab_file, max_char_length)
     for example in tqdm(examples):
         total_ += 1
 
@@ -144,6 +142,8 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
         total += 1
         context_idxs = np.zeros([para_limit], dtype=np.int32)
         questions_idxs = np.zeros([turn_limit, ques_limit], dtype=np.int32)
+        context_char_idxs = np.zeros([para_limit, max_char_length], dtype=np.int32)
+        questions_char_idxs = np.zeros([turn_limit, ques_limit, max_char_length], dtype=np.int32)
         starts = np.zeros([turn_limit, para_limit], dtype=np.float32)
         ends = np.zeros([turn_limit, para_limit], dtype=np.float32)
         em = np.zeros([turn_limit, para_limit], dtype=np.int32)
@@ -160,10 +160,6 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
                     return True
             return False
 
-        # get context char representation for elmo
-        context_char_idxs = np.zeros([para_limit, max_char_length], dtype=np.int32)
-        questions_char_idxs = np.zeros([turn_limit, ques_limit, max_char_length], dtype=np.int32)
-
         # type: List[str]
         tokenized_context = example["tokenized_context"]
         length = len(tokenized_context) + 2
@@ -175,7 +171,7 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
             question_char_idxs_without_mask = batcher._lm_vocab.encode_chars(sent, split=False)
             questions_char_idxs[k, :length, :] = question_char_idxs_without_mask + 1
 
-        # get em vector
+        # get em and context indexes vector
         for i, token in enumerate(tokenized_context):
             context_idxs[i] = _get_word(token)
             for j, tokenized_question in enumerate(example["tokenized_questions"]):
@@ -240,11 +236,12 @@ def prepro(config):
     word_emb_mat, word2idx_dict, word_vocab_txt = get_embedding(word_counter, "word", emb_file=config.glove_word_file,
                                                 size=config.glove_word_size, vec_size=config.glove_dim, token2idx_dict=word2idx_dict)
 
-    # TODO: write train/dev record files
+    # write train/dev record files
     build_features(config, train_examples, "train", config.train_record_file, word2idx_dict)
     build_features(config, dev_examples, "dev", config.dev_record_file, word2idx_dict)
 
-    # TODO: save preprocessed data to files
-    save(config.word_emb_file, word_emb_mat, message="word embedding")
-    save(config.word2idx_file, word2idx_dict, message="word2idx")
-    # save(config.lm_vocab_file, word_vocab_txt)
+    # save preprocessed data to files
+    save(config.glove_word_emb_file, word_emb_mat, message="word embedding")
+    save(config.glove_word2idx_file, word2idx_dict, message="word2idx")
+    # TODO:
+    pass # save(config.lm_vocab_file, word_vocab_txt)

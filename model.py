@@ -18,27 +18,32 @@ class FlowQA(object):
         self.context_idxs, self.questions_idxs, self.context_char_idxs, self.questions_char_idxs, \
             self.starts, self.ends, self.em, = iterator.get_next()
 
-        """
-        context_idxs: (batch_size, para_limit)
-        questions_idxs: (batch_size, turn_limit, ques_limit)
-        context_char_idxs: (batch_size, para_limit, 50)
-        questions_char_idxs: (batch_size, turn_limit, ques_limit, 50)
-        starts: (batch_size, turn_limit, para_limit)
-        ends: (batch_size, turn_limit, para_limit)
-        em: (batch_size, turn_limit, para_limit)
-        
-        """
-
         self.batch_size = config.batch_size
+        self.hidden_dim = config.hidden_dim
 
-        # TODO: create mask
-        # self.context_mask = tf.cast(self.context_idxs, tf.bool)
-        # self.questions_mask = tf.cast(self.questions_idxs, tf.bool)
+        # create mask
+        self.context_mask = tf.cast(self.context_idxs, tf.bool)
+        context_length = tf.reduce_sum(tf.cast(self.context_mask, tf.int32), axis=-1)
+        self.para_size = tf.reduce_max(context_length)
+        self.questions_mask = tf.cast(self.questions_idxs, tf.bool)
+        # shape: (batch_size, turn_size)
+        questions_length = tf.reduce_sum(tf.cast(self.context_mask, tf.int32), axis=-1)
+        self.ques_size = tf.reduce_max(questions_length)
+        turn_mask = tf.cast(questions_length, tf.bool)
+        # shape: (batch_size)
+        turns_length = tf.reduce_sum(tf.cast(turn_mask, tf.int32), axis=-1)
+        self.turn_size = tf.reduce_max(turns_length)
 
-        # context_length = tf.reduce_sum(tf.cast(self.context_mask, tf.int32), axis=1)
-        # max_context_length = tf.reduce_max(context_length)
-        # self.context_idxs = tf.slice(self.context_idxs, [0, 0], [batch_size, max_context_length])
+        # slice to get the desired tensors
+        self.context_idxs = tf.slice(self.context_idxs, [0, 0], [self.batch_size, self.para_size])
+        self.questions_idxs = tf.slice(self.questions_idxs, [0, 0], [self.batch_size, self.turn_size, self.ques_size])
+        self.context_char_idxs = tf.slice(self.context_char_idxs, [0, 0, 0], [self.batch_size, self.para_size + 2, -1])
+        self.questions_char_idxs = tf.slice(questions_char_idxs, [0, 0, 0, 0], [self.batch_size, self.turn_size, self.ques_size + 2, -1])
+        self.starts = tf.slice(self.starts, [0, 0, 0], [self.batch_size, self.turn_size, self.para_size])
+        self.ends = tf.slice(self.ends, [0, 0, 0], [self.batch_size, self.turn_size, self.para_size])
+        self.em = tf.slice(self.em, [0, 0, 0], [self.batch_size, self.turn_size, self.para_size])
 
+        # construct model
         self.ready()
 
         if trainable:
@@ -50,144 +55,169 @@ class FlowQA(object):
             self.train_op = self.optimizer.apply_gradients(zip(capped_grads, variables), global_step=self.global_step)
 
     def ready(self):
+        questions_batch = self.batch_size * self.turn_size
         with tf.variable_scope("embedding"):
-            # shape: (batch_size, para_limit, embedding_dim)
+            # shape: (batch_size, para_size, glove_dim)
             context_glove = tf.nn.embedding_lookup(self.word_mat, self.context_idxs)
-            # shape: (batch_size, turn_limit, ques_limit, embedding_dim)
+            # shape: (batch_size, turn_size, ques_size, glove_dim)
             questions_glove = tf.nn.embedding_lookup(self.word_mat, self.questions_idxs)
 
             with tf.variable_scope("elmo"):
-                bilm = BidirectionalLanguageModel(self.config.options_file, self.config.weight_file)
-                # shape: (batch_size, 3, para_limit, 1024)
+                # init bilm
+                bilm = BidirectionalLanguageModel(self.config.elmo_options_file, self.config.elmo_weight_file)
+                # shape: (batch_size, 3, para_size, 1024)
                 context_lm = bilm(self.context_char_idxs)
-                _questions_char_idxs = tf.reshape(self.questions_char_idxs, [batch_size*turn_limit, ques_limit, 50])
-                # shape: (batch_size*turn_limit, 3, ques_limit, 1024)
-                questions_lm = bilm(self.questions_char_idxs)
+                # shape: (batch_size*turn_size, ques_size, max_char_length)
+                _questions_char_idxs = tf.reshape(self.questions_char_idxs, [questions_batch, self.ques_size, self.config.max_char_length])
+                # shape: (batch_size*turn_size, 3, ques_size, 1024)
+                _questions_lm = bilm(_questions_char_idxs)
 
-                # shape: (batch_size, para_limit, 1024)
+                # shape: (batch_size, para_size, 1024)
                 context_elmo = weight_layers("name", context_lm, l2_coef=0.0)
                 with tf.variable_scope("", reuse=True):
-                    # shape: (batch_size*turn_limit, ques_limit, 1024)
-                    questions_elmo = weight_layers("name", questions_lm, l2_coef=0.0)
+                    _questions_elmo = weight_layers("name", _questions_lm, l2_coef=0.0)
+                    # shape: (batch_size, turn_size, ques_size, 1024)
+                    questions_elmo = tf.reshape(_questions_elmo, [self.batch_size, self.turn_size, self.ques_size, 1024])
 
-            # TODO: finish integrating elmo
-            pass
-
-            # TODO: integrating CoVe
-            pass
+            # load pretrained cove model from keras
             cove_model = load_model(self.config.cove_word_file)
+            # shape: (batch_size, para_size, cove_dim)
             context_cove = cove_model(context_glove)
-            _question_glove = tf.reshape(question_glove, [batch_size*turn_limit, ques_limit, embedding_dim])
-            questions_cove = cove_model(_questions_glove)
+            _questions_glove = tf.reshape(questions_glove, [questions_batch, self.ques_size, self.config.glove_dim])
+            _questions_cove = cove_model(_questions_glove)
+            questions_cove = tf.reshape(_questions_cove, [self.batch_size, self.turn_size, self.ques_size, self.config.cove_dim])
 
-
+            # shape: (batch_size, para_size, [glove_dim(300) + cove_dim(600) + elmo_dim(1024) = embedding_dim])
             c = tf.concat([context_glove, context_cove, context_elmo], axis=-1)
+            # shape: (batch_size, turn_size, ques_size, embedding_dim)
             q = tf.concat([questions_glove, questions_cove, questions_elmo], axis=-1)
-
 
         with tf.variable_scope("encoding"):
             # context encoding - attention on question
-            # shape: (batch_size, turn_limit, para_limit, embedding_dim)
-            g = question_attention(context_glove, questions_glove)
+            conf = (self.batch_size, self.turn_size, self.para_size, self.ques_size, self.glove_dim)
+            # shape: (batch_size, turn_size, para_size, glove_dim)
+            g = question_attention(context_glove, questions_glove, conf)
+            # shape: (batch_size, turn_size, para_size, 1)
             em = tf.expand_dims(self.em, axis=-1)
-            c = tf.tile(tf.expand_dims(c, axis=1), [1, turn_limit, 1, 1])
+            # shape: (batch_size, turn_size, para_size, embedding_dim)
+            c = tf.tile(tf.expand_dims(c, axis=1), [1, turn_size, 1, 1])
 
-            # shape: (batch_size, turn_limit, para_limit, embedding_dim + 1 + embedding_dim = context_dim)
-            c_0 = tf.concat([c, em, g], -1)
+            # shape: (batch_size, turn_size, para_size, [embedding_dim + 1 + glove_dim = total_dim])
+            c_0 = tf.concat([c, em, g], axis=-1)
 
             # question encoding - question integration
-            input_size = None
-            ques_limit = None
+            embedding_dim = self.config.glove_dim + self.config.cove_dim + self.config.elmo_dim
+            # shape: (batch_size*turn_size, ques_size, embedding_dim)
+            _q = tf.reshape(q, [questions_batch, self.ques_size, embedding_dim])
 
-            # shape: (batch_size*turn_limit, ques_limit, embedding_dim)
-            _q = tf.reshape(q, [batch_size*turn_limit, ques_limit, embedding_dim])
+            bi_lstm = rnn(num_layers=2, bidirectional=True, num_units=self.hidden_dim,
+                        batch_size=questions_batch, input_size=embedding_dim, is_train=self.is_train)
+            # shape: (batch_size*turn_size, ques_size, 4*hidden_dim)
+            _q_12 = bi_lstm(_q, seq_len=self.ques_size, concat_layers=True)
+            # shape: (batch_size, turn_size, ques_size, 4*hidden_dim)
+            q_12 = tf.reshape(_q_12, [batch_size, turn_size, ques_size, 4*self.hidden_dim])
+            # shape: (batch_size, turn_size, ques_size, 2*hidden_dim)
+            q_1 = tf.slice(q_12, [0, 0, 0, 0], [-1, -1, -1, 2*self.hidden_dim])
+            q_2 = tf.slice(q_12, [0, 0, 0, 2*self.hidden_dim], [-1, -1, -1, -1])
 
-            bi_lstm = rnn(num_layers=2, bidirectional=True, num_units=config.hidden_dim,
-                        batch_size=batch_size*turn_limit, input_size=input_size, is_train=self.is_train)
-            # shape: (batch_size*turn_limit, ques_limit, 4*hidden_dim)
-            _q_12 = bi_lstm(_q, seq_len=ques_limit, concat_layers=True)
-            # shape: (batch_size, turn_limit, ques_limit, 4*hidden_dim)
-            q_12 = tf.reshape(_q_12, [batch_size, turn_limit, ques_limit, 4*hidden_dim])
-            # shape: (batch_size, turn_limit, ques_limit, 2*hidden_dim)
-            q_1 = tf.slice(q_12, [0, 0, 0, 0], [-1, -1, -1, 2*hidden_dim])
-            q_2 = tf.slice(q_12, [0, 0, 0, 2*hidden_dim], [-1, -1, -1, -1])
-
-            # shape: (batch_size, turn_limit, ques_limit)
+            # shape: (batch_size, turn_size, ques_size)
             q_2_fc = tf.squeeze(tf.layers.dense(q_2, 1, use_bias=False), axis=-1)
-            q_2_logits = tf.nn.softmax(q_2_fc)
+            q_2_weights = tf.nn.softmax(q_2_fc)
 
-            # shape: (batch_size, turn_limit, 2*hidden_dim)
-            q_tilde = tf.squeeze(tf.matmul(tf.expand_dims(q_2_logits, axis=2), q_2), axis=2)
+            # shape: (batch_size, turn_size, 2*hidden_dim)
+            q_tilde = tf.squeeze(tf.matmul(tf.expand_dims(q_2_weights, axis=2), q_2), axis=2)
 
-            uni_lstm = rnn(num_layers=1, bidirectional=False, num_units=config.hidden_dim,
-                        batch_size=batch_size, input_size=hidden_dim, is_train=self.is_train)
-            # shape: (batch_size, turn_limit, hidden_dim)
-            p = uni_lstm(q_tilde, seq_len=turn_limit, concat_layers=False)
+            uni_lstm = rnn(num_layers=1, bidirectional=False, num_units=self.hidden_dim,
+                        batch_size=self.batch_size, input_size=2*self.hidden_dim, is_train=self.is_train)
+            # shape: (batch_size, turn_size, hidden_dim)
+            p = uni_lstm(q_tilde, seq_len=self.turn_size, concat_layers=False)
 
         with tf.variable_scope("reasoning"):
             # integration-flow x2
-            # shape: (batch_size, turn_limit, para_limit, embedding_dim)
-            c_1 = integration_flow(c_0)
-            c_2 = integration_flow(c_1)
+            conf = (self.batch_size, self.turn_size, self.para_size, self.total_dim, self.hidden_dim)
+            # shape: (batch_size, turn_size, para_size, 3*hidden_dim)
+            c_1 = integration_flow(c_0, conf, self.is_train)
+            conf = (self.batch_size, self.turn_size, self.para_size, 3*self.hidden_dim, self.hidden_dim)
+            c_2 = integration_flow(c_1, conf, self.is_train)
 
             # attention on question
-            # shape: (batch_size, turn_limit, para_limit, concat_dim)
+            # shape: (batch_size, turn_size, para_size, [total_dim + 3*hidden_dim + 3*hidden_dim = c_concat_dim])
             c_concat = tf.concat([c_0, c_1, c_2], axis=-1)
-            # shape: (batch_size, turn_limit, ques_limit, concat_dim)
-            q_concat = tf.concat([question_emb, q_1, q_2], axis=-1)
+            # shape: (batch_size, turn_size, ques_size, [embedding_dim + 2*hidden_dim + 2*hidden_dim = q_concat_dim)
+            q_concat = tf.concat([question____emb, q_1, q_2], axis=-1)
 
-            # shape: (batch_size, turn_limit, para_limit, hidden_dim)
-            q_hat = fully_aware_attention(c_concat, q_concat, q_2)
+            # shape: (batch_size, turn_size, para_size, hidden_dim)
+            conf = (self.batch_size, self.turn_size, self.ques_size, self.config.attention_dim)
+            # shape: (batch_size, turn_size, para_size, 2*hidden_dim)
+            q_hat = fully_aware_attention(c_concat, q_concat, q_2, conf)
 
             # integration-flow
+            # shape: (batch_size, turn_size, para_size, [3*hidden_dim + 2*hidden_dim])
             c_q_concat = tf.concat([c_2, q_hat], axis=-1)
-            c_3 = integration_flow(c_q_concat)
+            conf = (self.batch_size, self.turn_size, self.para_size, 5*self.hidden_dim, self.hidden_dim)
+            # shape: (batch_size, turn_size, para_size, 3*hidden_dim)
+            c_3 = integration_flow(c_q_concat, conf, self.is_train)
 
             # attention on context
+            # shape: (batch_size, turn_size, para_size, 9*hidden_dim)
             c_concat = tf.concat([c_1, c_2, c_3], axis=-1)
-            # shape: (batch_size, turn_limit, para_limit, hidden_dim)
-            c_hat = fully_aware_attention(c_concat, c_concat, c_3)
+            conf = (self.batch_size, self.turn_size, self.ques_size, self.config.attention_dim)
+            # shape: (batch_size, turn_size, para_size, 3*hidden_dim)
+            c_hat = fully_aware_attention(c_concat, c_concat, c_3, conf)
 
             # integration
+            # shape: (batch_size, turn_size, para_size, 6*hidden_dim = encoding_dim)
             cc_concat = tf.concat([c_3, c_hat], axis=-1)
-            bi_lstm = rnn(num_layers=1, bidirectional=True, num_units=config.hidden_dim,
-                        batch_size=batch_size, input_size=hidden_dim, is_train=self.is_train)
-            _cc_concat = tf.reshape(cc_concat, [batch_size*turn_limit, para_limit, embedding_dim])
-            _c_4 = bi_lstm(_cc_concat, seq_len=ques_limit, concat_layers=False)
-            c_4 = tf.reshape(_c_4, [batch_size, turn_limit, para_limit, embedding_dim])
+            encoding_dim = 6 * self.hidden_dim
+
+            bi_lstm = rnn(num_layers=1, bidirectional=True, num_units=self.hidden_dim,
+                        batch_size=questions_batch, input_size=encoding_dim, is_train=self.is_train)
+            _cc_concat = tf.reshape(cc_concat, [questions_batch, self.para_size, encoding_dim])
+            # shape: (batch_size*turn_size, para_size, encoding_dim)
+            _c_4 = bi_lstm(_cc_concat, seq_len=self.para_size, concat_layers=False)
+            c_4 = tf.reshape(_c_4, [batch_size, turn_size, para_size, encoding_dim])
 
         with tf.variable_scope("prediction"):
-            # shape: (batch_size, turn_limit, embedding_dim)
-            p_fc = tf.layers.dense(p, embedding_dim, use_bias=False)
+            # shape: (batch_size, turn_size, encoding_dim)
+            p_fc = tf.layers.dense(p, encoding_dim, use_bias=False)
 
-            # shape: (batch_size, turn_limit, para_limit)
+            # shape: (batch_size, turn_size, para_size)
             start_logits = tf.squeeze(tf.matmul(c_4, tf.expand_dims(p_fc, axis=-1)), axis=-1)
             start_probs = tf.nn.softmax(start_logits)
 
-            # shape: (batch_size, turn_limit, embedding_dim)
+            # shape: (batch_size, turn_size, encoding_dim)
             c_4_avg = tf.squeeze(tf.matmul(tf.expand_dims(start_probs, axis=2), c_4), axis=2)
             gru = tf.contrib.rnn.GruCell(hidden_dim)
-            # shape: (batch_size, turn_limit, embedding_dim)
+            # shape: (batch_size, turn_size, hidden_dim)
             p_hat = gru(p, c_4_avg)
-            # shape: (batch_size, turn_limit, embedding_dim)
-            p_hat_fc = tf.layers.dense(p_hat, embedding_dim, use_bias=False)
-            # shape: (batch_size, turn_limit, para_limit)
+            # shape: (batch_size, turn_size, encoding_dim)
+            p_hat_fc = tf.layers.dense(p_hat, encoding_dim, use_bias=False)
+            # shape: (batch_size, turn_size, para_size)
             end_logits = tf.squeeze(tf.matmul(c_4, tf.expand_dims(p_hat_fc, axis=-1)), axis=-1)
             end_probs = tf.nn.softmax(end_logits)
 
-            # TODO: no-answer
-            # shape: (batch_size, turn_limit, embedding_dim)
+            # shape: (batch_size, turn_size, encoding_dim)
             c_4_sum = tf.reduce_sum(c_4, axis=2)
             c_4_max = tf.reduce_max(c_4, axis=2)
-            # shape: (batch_size, turn_limit, concat_dim)
+            # shape: (batch_size, turn_size, 2*encoding_dim)
             c_4_concat = tf.concat([c_4_sum, c_4_max], axis=-1)
-            # shape: (batch_size, turn_limit, concat_dim)
-            p_fc = tf.layers.dense(p, concat_dim, use_bias=False)
-            # shape: (batch_size, turn_limit)
-            no_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2),
+            # shape: (batch_size, turn_size, 2*encoding_dim)
+            p_fc = tf.layers.dense(p, 2*encoding_dim, use_bias=False)
+            # shape: (batch_size, turn_size)
+            no_answer_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2),
                                              tf.expand_dims(p_fc, axis=-1)), axis=-1)
-            no_probs = tf.nn.sigmoid(no_logits)
+            no_answer_probs = tf.nn.sigmoid(no_logits)
 
         with tf.name_scope("loss"):
-            # TODO:
-            self.loss = None
+            # TODO: create mask for logits
+            _start_logits = tf.reshape(start_logits, [-1, self.para_size])
+            _end_logits = tf.reshape(end_logits, [-1, self.para_size])
+            _starts = tf.reshape(starts, [-1, self.para_size])
+            _ends = tf.reshape(ends, [-1, self.para_size])
+            start_losses = tf.nn.softmax_cross_entropy_with_logits_v2(logits=_start_logits, labels=_starts)
+            end_losses = tf.nn.softmax_cross_entropy_with_logits_v2(logits=_end_logits, labels=_ends)
+            self.loss = tf.reduce_mean(start_losses + end_losses)
+
+            # for CoQA
+            
+            # for QuAC
