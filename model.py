@@ -1,5 +1,5 @@
 import tensorflow as tf
-from layer import rnn, integration_flow, question_attention, fully_aware_attention
+from layer import rnn, integration_flow, question_attention, fully_aware_attention, softmax_mask
 from bilm import BidirectionalLanguageModel, weight_layers
 from keras.models import load_model
 
@@ -16,7 +16,7 @@ class FlowQA(object):
                                         initializer=tf.constant(word_mat, dtype=tf.float32), trainable=False)
 
         self.context_idxs, self.questions_idxs, self.context_char_idxs, self.questions_char_idxs, \
-            self.starts, self.ends, self.em, = iterator.get_next()
+            self.starts, self.ends, self.em, self.yes_answers, self.no_answers, self.unk_answers, self.span_flag = iterator.get_next()
 
         self.batch_size = config.batch_size
         self.hidden_dim = config.hidden_dim
@@ -29,19 +29,25 @@ class FlowQA(object):
         # shape: (batch_size, turn_size)
         questions_length = tf.reduce_sum(tf.cast(self.context_mask, tf.int32), axis=-1)
         self.ques_size = tf.reduce_max(questions_length)
-        turn_mask = tf.cast(questions_length, tf.bool)
+        self.turn_mask = tf.cast(questions_length, tf.bool)
         # shape: (batch_size)
         turns_length = tf.reduce_sum(tf.cast(turn_mask, tf.int32), axis=-1)
         self.turn_size = tf.reduce_max(turns_length)
 
         # slice to get the desired tensors
         self.context_idxs = tf.slice(self.context_idxs, [0, 0], [self.batch_size, self.para_size])
-        self.questions_idxs = tf.slice(self.questions_idxs, [0, 0], [self.batch_size, self.turn_size, self.ques_size])
+        self.context_mask = tf.slice(self.context_mask, [0, 0], [self.batch_size, self.para_size])
+        self.questions_idxs = tf.slice(self.questions_idxs, [0, 0, 0], [self.batch_size, self.turn_size, self.ques_size])
+        self.questions_mask = tf.slice(self.questions_mask, [0, 0, 0], [self.batch_size, self.turn_size, self.ques_size])
         self.context_char_idxs = tf.slice(self.context_char_idxs, [0, 0, 0], [self.batch_size, self.para_size + 2, -1])
         self.questions_char_idxs = tf.slice(questions_char_idxs, [0, 0, 0, 0], [self.batch_size, self.turn_size, self.ques_size + 2, -1])
         self.starts = tf.slice(self.starts, [0, 0, 0], [self.batch_size, self.turn_size, self.para_size])
         self.ends = tf.slice(self.ends, [0, 0, 0], [self.batch_size, self.turn_size, self.para_size])
         self.em = tf.slice(self.em, [0, 0, 0], [self.batch_size, self.turn_size, self.para_size])
+        self.yes_answers = tf.slice(self.yes_answers, [0, 0], [self.batch_size, self.turn_size])
+        self.no_answers = tf.slice(self.no_answers, [0, 0], [self.batch_size, self.turn_size])
+        self.unk_answers = tf.slice(self.unk_answers, [0, 0], [self.batch_size, self.turn_size])
+        self.turn_mask = tf.slice(self.turn_mask, [0, 0], [self.batch_size, self.turn_size])
 
         # construct model
         self.ready()
@@ -122,6 +128,7 @@ class FlowQA(object):
 
             # shape: (batch_size, turn_size, ques_size)
             q_2_fc = tf.squeeze(tf.layers.dense(q_2, 1, use_bias=False), axis=-1)
+            q_2_fc = softmax_mask(q_2_fc, self.questions_mask)
             q_2_weights = tf.nn.softmax(q_2_fc)
 
             # shape: (batch_size, turn_size, 2*hidden_dim)
@@ -202,22 +209,60 @@ class FlowQA(object):
             # shape: (batch_size, turn_size, 2*encoding_dim)
             c_4_concat = tf.concat([c_4_sum, c_4_max], axis=-1)
             # shape: (batch_size, turn_size, 2*encoding_dim)
-            p_fc = tf.layers.dense(p, 2*encoding_dim, use_bias=False)
+            unk_answer_p_fc = tf.layers.dense(p, 2*encoding_dim, use_bias=False)
+            # shape: (batch_size, turn_size)
+            unk_answer_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2),
+                                             tf.expand_dims(unk_answer_p_fc, axis=-1)), axis=-1)
+            unk_answer_probs = tf.nn.sigmoid(unk_answer_logits)
+
+            # shape: (batch_size, turn_size, 2*encoding_dim)
+            yes_answer_p_fc = tf.layers.dense(p, 2*encoding_dim, use_bias=False)
+            # shape: (batch_size, turn_size)
+            yes_answer_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2),
+                                             tf.expand_dims(yes_answer_p_fc, axis=-1)), axis=-1)
+            yes_answer_probs = tf.nn.sigmoid(yes_answer_logits)
+
+            # shape: (batch_size, turn_size, 2*encoding_dim)
+            no_p_fc = tf.layers.dense(p, 2*encoding_dim, use_bias=False)
             # shape: (batch_size, turn_size)
             no_answer_logits = tf.squeeze(tf.matmul(tf.expand_dims(c_4_concat, axis=2),
-                                             tf.expand_dims(p_fc, axis=-1)), axis=-1)
-            no_answer_probs = tf.nn.sigmoid(no_logits)
+                                             tf.expand_dims(no_answer_p_fc, axis=-1)), axis=-1)
+            no_answer_probs = tf.nn.sigmoid(no_answer_logits)
 
         with tf.name_scope("loss"):
-            # TODO: create mask for logits
             _start_logits = tf.reshape(start_logits, [-1, self.para_size])
             _end_logits = tf.reshape(end_logits, [-1, self.para_size])
+            context_mask = tf.tile(tf.expand_dims(self.context_mask, axis=1), [1, self.turn_size, 1])
+            _start_logits_masked = softmax_mask(_start_logits, context_mask)
+            _end_logits_masked = softmax_mask(_end_logits, context_mask)
             _starts = tf.reshape(starts, [-1, self.para_size])
             _ends = tf.reshape(ends, [-1, self.para_size])
-            start_losses = tf.nn.softmax_cross_entropy_with_logits_v2(logits=_start_logits, labels=_starts)
-            end_losses = tf.nn.softmax_cross_entropy_with_logits_v2(logits=_end_logits, labels=_ends)
-            self.loss = tf.reduce_mean(start_losses + end_losses)
 
-            # for CoQA
-            
-            # for QuAC
+            span_losses = tf.nn.softmax_cross_entropy_with_logits_v2(logits=_start_logits_masked, labels=_starts) + \
+                tf.nn.softmax_cross_entropy_with_logits_v2(logits=_end_logits_masked, labels=_ends)
+            _turn_mask = tf.reshape(self.turn_mask, [-1])
+            span_losses_masked = tf.boolean_mask(span_losses, _turn_mask)
+            span_loss = tf.reduce_mean(span_losses_masked)
+
+            # yes/no questions
+            _unk_answer_logits = tf.reshape(_unk_answer_logits, [-1])
+            _unk_answer_logits_masked = tf.boolean_mask(_unk_answer_logits, _turn_mask)
+            _unk_answers = tf.reshape(self.unk_answers, [-1])
+            _unk_answers_masked = tf.boolean_mask(_unk_answers, _turn_mask)
+
+            _yes_answer_logits = tf.reshape(yes_answer_logits, [-1])
+            _yes_answer_logits_masked = tf.boolean_mask(_yes_answer_logits, _turn_mask)
+            _yes_answers = tf.reshape(self.yes_answers, [-1])
+            _yes_answers_masked = tf.boolean_mask(_yes_answers, _turn_mask)
+
+            _no_answer_logits = tf.reshape(no_answer_logits, [-1])
+            _no_answer_logits_masked = tf.boolean_mask(_no_answer_logits, _turn_mask)
+            _no_answers = tf.reshape(self.no_answers, [-1])
+            _no_answers_masked = tf.boolean_mask(_no_answers, _turn_mask)
+
+            yes_no_unk_losses = tf.nn.sigmoid_cross_entropy_with_logits(logits=_yes_answer_logits_masked, labels=_yes_answers_masked) + \
+                tf.nn.sigmoid_cross_entropy_with_logits(logits=_no_answer_logits_masked, labels=_no_answers_masked) + \
+                tf.nn.sigmoid_cross_entropy_with_logits(logits=_unk_answer_logits_masked, labels=_unk_answers_masked)
+            yes_no_unk_loss = tf.reduce_mean(yes_no_unk_losses)
+            span_loss = tf.cond(tf.equal(span_flag, 1), span_loss, 0)
+            self.loss = yes_no_unk_loss + span_loss

@@ -87,6 +87,10 @@ class rnn:
         return res
 
 
+def softmax_mask(val, mask):
+    return -INF * (1 - tf.cast(mask, tf.float32)) + val
+
+
 def question_attention(context, questions, conf):
     """
     Parameters

@@ -28,7 +28,7 @@ def convert_idx(text, tokens):
         current += len(token)
     return spans
 
-
+# for CoQA dataset
 def process_file(filename, data_type, word_counter):
     print("Generating {} examples...".format(data_type))
     examples = []
@@ -39,6 +39,8 @@ def process_file(filename, data_type, word_counter):
             context = conversation["story"].replace("''", '" ').replace("``", '" ')
             tokenized_context = tokenize_sentence(context)
 
+            spans = convert_idx(context, tokenized_context)
+
             for token in tokenized_context:
                 word_counter[token] += 1
 
@@ -48,7 +50,9 @@ def process_file(filename, data_type, word_counter):
             tokenized_questions = []
             starts = []
             ends = []
+            yes_answers, no_answers, unk_answers = [], [], []
             total_conversation += 1
+            span_flag = 1
             
             for question, answer in zip(questions, answers):
                 ques = question["input_text"].replace("''", '" ').replace("``", '" ')
@@ -61,11 +65,39 @@ def process_file(filename, data_type, word_counter):
 
                 answer_start = answer["span_start"]
                 answer_end = answer["span_end"]
-                starts.append(answer_start)
-                ends.append(answer_end)
+
+                span_text = answer["span_text"]
+                input_text = answer["input_text"]
+                tokenized_input_text = tokenize_sentence(input_text)
+
+                yes, no, unk = 0, 0, 0
+                if tokenized_input_text[0].lower() == "yes":
+                    yes = 1
+                if tokenized_input_text[0].lower() == "no":
+                    no = 1
+                if tokenized_input_text[0].lower() == "unknown":
+                    unk = 1
+
+                yes_answers.append(yes)
+                no_answers.append(no)
+                unk_answers.append(unk)
+                answer_span = []
+
+                for idx, span in enumerate(spans):
+                    if not (answer_end <= span[0] or answer_start >= span[1]):
+                        answer_span.append(idx)
+
+                if not answer_span:
+                    span_flag = 0
+                    answer_span.append(-1)
+                span_start = answer_span[0]
+                span_end = answer_span[-1]
+                starts.append(span_start)
+                ends.append(span_end)
 
             example = {"tokenized_context": tokenized_context, "tokenized_questions": tokenized_questions,
-                            "starts": starts, "ends": ends, "id": total_conversation}
+                            "starts": starts, "ends": ends, "id": total_conversation, "span_flag": span_flag,
+                            "yes_answers": yes_answers, "no_answers": no_answers, "unk_answers": unk_answers}
             examples.append(example)
  
         random.shuffle(examples)
@@ -110,10 +142,7 @@ def get_embedding(counter, data_type, limit=-1, emb_file=None, size=None, vec_si
                     for token, idx in token2idx_dict.items()}
     emb_mat = [idx2emb_dict[idx] for idx in range(len(idx2emb_dict))]
 
-    # TODO: return word_vocab here
-    word_vocab_txt = None
-
-    return emb_mat, token2idx_dict, word_vocab_txt
+    return emb_mat, token2idx_dict
 
 
 def build_features(config, examples, data_type, out_file, word2idx_dict, is_test=False):
@@ -147,6 +176,9 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
         starts = np.zeros([turn_limit, para_limit], dtype=np.float32)
         ends = np.zeros([turn_limit, para_limit], dtype=np.float32)
         em = np.zeros([turn_limit, para_limit], dtype=np.int32)
+        yes_answers = np.zeros([turn_limit], dtype=np.int32)
+        no_answers = np.zeros([turn_limit], dtype=np.int32)
+        unk_answers = np.zeros([turn_limit], dtype=np.int32)
 
         def _get_word(word):
             for each in (word, word.lower(), word.capitalize(), word.upper()):
@@ -191,6 +223,12 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
         for i, idx in enumerate(example["ends"]):
             ends[i, idx] = 1.0
 
+        # get label of yes/no questions
+        length = len(example["yes_answers"])
+        yes_answers[:length] = example["yes_answers"]
+        no_answers[:length] = example["no_answers"]
+        unk_answers[:length] = example["unk_answers"]
+
         feature_dict = {
             "context_idxs": tf.train.Feature(bytes_list=tf.train.ByteList(value=[context_idxs.tostring()])),
             "questions_idxs": tf.train.Feature(bytes_list=tf.train.ByteList(value=[questions_idxs.tostring()])),
@@ -198,10 +236,14 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
             "question_char_idxs":tf.train.Feature(bytes_list=tf.train.ByteList(value=[questions_char_idxs.tostring()])),
             "starts": tf.train.Feature(bytes_list=tf.train.ByteList(value=[starts.tostring()])),
             "ends": tf.train.Feature(bytes_list=tf.train.ByteList(value=[ends.tostring()])),
-            "em": tf.train.Features(bytes_list=tf.train.ByteList(value=[em.tostring()]))
+            "em": tf.train.Feature(bytes_list=tf.train.ByteList(value=[em.tostring()])),
+            "yes_answers": tf.train.Feature(bytes_list=tf.train.ByteList(value=[yes_answers.tostring()])),
+            "no_answers": tf.train.Feature(bytes_list=tf.train.ByteList(value=[no_answers.tostring()])),
+            "unk_answers": tf.train.Feature(bytes_list=tf.train.ByteList(value=[unk_answers.tostring()])),
+            "span_flag": tf.train.Feature(int64_list=tf.train.Int64List(value=[example["span_flag"]]))
         }
 
-        record = tf.train.Example(features=feature_dict)
+        record = tf.train.Example(features=tf.train.Features(feature=feature_dict))
         writer.write(record.SerializeToString())
 
     print("Build {} / {} instances of features in total".format(total, total_))
@@ -222,18 +264,18 @@ def prepro(config):
     # init counters
     word_counter, char_counter = Counter(), Counter()
 
-    # process train/dev file to extract data
+    # extract data to examples
     train_examples = process_file(config.train_file, "train", word_counter)
     dev_examples = process_file(config.dev_file, "dev", word_counter)
 
-    # word-to-index dictionary
+    # init word-to-index dictionary
     word2idx_dict = None
     if os.path.isfile(config.word2idx_file):
         with open(config.word2idx_file, "r") as fh:
             word2idx_dict = json.load(fh)
 
     # get embedding matrix
-    word_emb_mat, word2idx_dict, word_vocab_txt = get_embedding(word_counter, "word", emb_file=config.glove_word_file,
+    word_emb_mat, word2idx_dict = get_embedding(word_counter, "word", emb_file=config.glove_word_file,
                                                 size=config.glove_word_size, vec_size=config.glove_dim, token2idx_dict=word2idx_dict)
 
     # write train/dev record files
@@ -243,5 +285,8 @@ def prepro(config):
     # save preprocessed data to files
     save(config.glove_word_emb_file, word_emb_mat, message="word embedding")
     save(config.glove_word2idx_file, word2idx_dict, message="word2idx")
-    # TODO:
-    pass # save(config.lm_vocab_file, word_vocab_txt)
+
+    with open(config.elmo_vocab_file, "w") as f:
+        print("Saving elmo vocabulary...")
+        for item in word2idx_dict.keys():
+            f.write("%s\n" % item)

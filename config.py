@@ -59,10 +59,11 @@ flags.DEFINE_integer("hidden_dim", 75, "size of hidden dim")
 # set training config
 flags.DEFINE_integer("batch_size", 1, "batch of training data")
 flags.DEFINE_integer("grad_clip", 5, "global norm gradient clipping")
-flags.DEFINE_integer("num_steps", 1000, "number of training steps")
 flags.DEFINE_integer("dev_batch_size", 5, "batch of validation data")
 flags.DEFINE_integer("dev_steps", 23, "number of validation steps")
 flags.DEFINE_float("learning_rate", 10e-3, "learning rate")
+flags.DEFINE_integer("num_steps", 1000, "number of training steps")
+flags.DEFINE_integer("period", 1000, "training period")
 
 
 def main(_):
@@ -72,7 +73,8 @@ def main(_):
     elif config.mode == "preprocess":
         prepro(config)
     elif config.mode == "debug":
-        # TODO: set debug configuration
+        config.num_steps = 2
+        config.period = 1
         train(config)
     elif config.mode == "evaluate":
         pass
