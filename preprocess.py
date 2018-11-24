@@ -51,10 +51,11 @@ def process_file(filename, data_type, word_counter):
             starts = []
             ends = []
             yes_answers, no_answers, unk_answers = [], [], []
+            span_flag = []
             total_conversation += 1
-            span_flag = 1
             
             for question, answer in zip(questions, answers):
+                flag = 1
                 ques = question["input_text"].replace("''", '" ').replace("``", '" ')
                 tokenized_question = tokenize_sentence(ques)
 
@@ -88,12 +89,13 @@ def process_file(filename, data_type, word_counter):
                         answer_span.append(idx)
 
                 if not answer_span:
-                    span_flag = 0
+                    flag = 0
                     answer_span.append(-1)
                 span_start = answer_span[0]
                 span_end = answer_span[-1]
                 starts.append(span_start)
                 ends.append(span_end)
+                span_flag.append(flag)
 
             example = {"tokenized_context": tokenized_context, "tokenized_questions": tokenized_questions,
                             "starts": starts, "ends": ends, "id": total_conversation, "span_flag": span_flag,
@@ -152,7 +154,7 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
     turn_limit = config.turn_limit
 
     def filter_func(example):
-        return len(example["context_tokens"]) > para_limit or len(example["ques_tokens"]) > ques_limit
+        return len(example["tokenized_context"]) > para_limit #or len(example["ques_tokens"]) > ques_limit
 
     print("Processing {} examples...".format(data_type))
     writer = tf.python_io.TFRecordWriter(out_file)
@@ -165,20 +167,21 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
     for example in tqdm(examples):
         total_ += 1
 
-        if filter_func(example, is_test):
+        if filter_func(example):
             continue
 
         total += 1
         context_idxs = np.zeros([para_limit], dtype=np.int32)
         questions_idxs = np.zeros([turn_limit, ques_limit], dtype=np.int32)
-        context_char_idxs = np.zeros([para_limit, max_char_length], dtype=np.int32)
-        questions_char_idxs = np.zeros([turn_limit, ques_limit, max_char_length], dtype=np.int32)
+        context_char_idxs = np.zeros([para_limit + 2, max_char_length], dtype=np.int32)
+        questions_char_idxs = np.zeros([turn_limit, ques_limit + 2, max_char_length], dtype=np.int32)
         starts = np.zeros([turn_limit, para_limit], dtype=np.float32)
         ends = np.zeros([turn_limit, para_limit], dtype=np.float32)
         em = np.zeros([turn_limit, para_limit], dtype=np.int32)
         yes_answers = np.zeros([turn_limit], dtype=np.int32)
         no_answers = np.zeros([turn_limit], dtype=np.int32)
         unk_answers = np.zeros([turn_limit], dtype=np.int32)
+        span_flag = np.zeros([turn_limit], dtype=np.int32)
 
         def _get_word(word):
             for each in (word, word.lower(), word.capitalize(), word.upper()):
@@ -228,19 +231,20 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, is_test
         yes_answers[:length] = example["yes_answers"]
         no_answers[:length] = example["no_answers"]
         unk_answers[:length] = example["unk_answers"]
+        span_flag[:length] = example["span_flag"]
 
         feature_dict = {
-            "context_idxs": tf.train.Feature(bytes_list=tf.train.ByteList(value=[context_idxs.tostring()])),
-            "questions_idxs": tf.train.Feature(bytes_list=tf.train.ByteList(value=[questions_idxs.tostring()])),
-            "context_char_idxs":tf.train.Feature(bytes_list=tf.train.ByteList(value=[context_char_idxs.tostring()])),
-            "question_char_idxs":tf.train.Feature(bytes_list=tf.train.ByteList(value=[questions_char_idxs.tostring()])),
-            "starts": tf.train.Feature(bytes_list=tf.train.ByteList(value=[starts.tostring()])),
-            "ends": tf.train.Feature(bytes_list=tf.train.ByteList(value=[ends.tostring()])),
-            "em": tf.train.Feature(bytes_list=tf.train.ByteList(value=[em.tostring()])),
-            "yes_answers": tf.train.Feature(bytes_list=tf.train.ByteList(value=[yes_answers.tostring()])),
-            "no_answers": tf.train.Feature(bytes_list=tf.train.ByteList(value=[no_answers.tostring()])),
-            "unk_answers": tf.train.Feature(bytes_list=tf.train.ByteList(value=[unk_answers.tostring()])),
-            "span_flag": tf.train.Feature(int64_list=tf.train.Int64List(value=[example["span_flag"]]))
+            "context_idxs": tf.train.Feature(bytes_list=tf.train.BytesList(value=[context_idxs.tostring()])),
+            "questions_idxs": tf.train.Feature(bytes_list=tf.train.BytesList(value=[questions_idxs.tostring()])),
+            "context_char_idxs":tf.train.Feature(bytes_list=tf.train.BytesList(value=[context_char_idxs.tostring()])),
+            "questions_char_idxs":tf.train.Feature(bytes_list=tf.train.BytesList(value=[questions_char_idxs.tostring()])),
+            "starts": tf.train.Feature(bytes_list=tf.train.BytesList(value=[starts.tostring()])),
+            "ends": tf.train.Feature(bytes_list=tf.train.BytesList(value=[ends.tostring()])),
+            "em": tf.train.Feature(bytes_list=tf.train.BytesList(value=[em.tostring()])),
+            "yes_answers": tf.train.Feature(bytes_list=tf.train.BytesList(value=[yes_answers.tostring()])),
+            "no_answers": tf.train.Feature(bytes_list=tf.train.BytesList(value=[no_answers.tostring()])),
+            "unk_answers": tf.train.Feature(bytes_list=tf.train.BytesList(value=[unk_answers.tostring()])),
+            "span_flag": tf.train.Feature(bytes_list=tf.train.BytesList(value=[span_flag.tostring()]))
         }
 
         record = tf.train.Example(features=tf.train.Features(feature=feature_dict))
@@ -270,13 +274,22 @@ def prepro(config):
 
     # init word-to-index dictionary
     word2idx_dict = None
-    if os.path.isfile(config.word2idx_file):
-        with open(config.word2idx_file, "r") as fh:
+    if os.path.isfile(config.glove_word2idx_file):
+        with open(config.glove_word2idx_file, "r") as fh:
             word2idx_dict = json.load(fh)
 
     # get embedding matrix
     word_emb_mat, word2idx_dict = get_embedding(word_counter, "word", emb_file=config.glove_word_file,
                                                 size=config.glove_word_size, vec_size=config.glove_dim, token2idx_dict=word2idx_dict)
+
+    # save elmo vocab file
+    with open(config.elmo_vocab_file, "w") as f:
+        print("Saving elmo vocabulary...")
+        f.write("</S>\n")
+        f.write("<S>\n")
+        f.write("<UNK>\n")
+        for item in word2idx_dict.keys():
+            f.write("%s\n" % item)
 
     # write train/dev record files
     build_features(config, train_examples, "train", config.train_record_file, word2idx_dict)
@@ -286,7 +299,3 @@ def prepro(config):
     save(config.glove_word_emb_file, word_emb_mat, message="word embedding")
     save(config.glove_word2idx_file, word2idx_dict, message="word2idx")
 
-    with open(config.elmo_vocab_file, "w") as f:
-        print("Saving elmo vocabulary...")
-        for item in word2idx_dict.keys():
-            f.write("%s\n" % item)
