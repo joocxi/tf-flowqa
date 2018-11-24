@@ -10,7 +10,7 @@ from util import get_parser, get_train_dataset, get_dev_dataset
 
 def train(config):
 
-    with open(config.word_emb_file, "r") as wm:
+    with open(config.glove_word_emb_file, "r") as wm:
         word_mat = np.array(json.load(wm), dtype=np.float32)
 
     # create train/dev iterator
@@ -30,18 +30,30 @@ def train(config):
     sess_config.gpu_options.allow_growth = True
 
     with tf.Session(config=sess_config) as sess:
-        # TODO: implement training
+
+        writer = tf.summary.FileWriter(config.log_dir, sess.graph)
         sess.run(tf.global_variables_initializer())
+
         train_handle = sess.run(train_iterator.string_handle())
         dev_handle = sess.run(dev_iterator.string_handle())
 
         sess.run(tf.assign(model.learning_rate, tf.constant(config.learning_rate, dtype=tf.float32)))
         sess.run(tf.assign(model.is_train, tf.constant(True, dtype=tf.bool)))
-
-        for _ in tqdm(range(1, config.num_steps + 1)):
+        for _ in tqdm(range(config.train_steps)):
             global_step = sess.run(model.global_step) + 1
-            loss, train_op = sess.run([model.loss, model.train_op], feed_dict={handle: train_handle})
-
-            if global_step % config.period == 0:
+            loss, _ = sess.run([model.loss, model.train_op], feed_dict={handle: train_handle})
+            if global_step % config.save_period == 0:
+                loss_sum = tf.Summary(value=[tf.Summary.Value(tag="model/loss", simple_value=loss)])
+                writer.add_summary(loss_sum, global_step)
+            if global_step % config.dev_period == 0:
                 sess.run(tf.assign(model.is_train, tf.constant(False, dtype=tf.bool)))
+                dev_losses = []
+                for _ in tqdm(range(config.dev_steps)):
+                    dev_loss = sess.run(model.loss, feed_dict={handle: dev_handle})
+                    dev_losses.append(dev_loss)
+
                 sess.run(tf.assign(model.is_train, tf.constant(True, dtype=tf.bool)))
+                dev_loss_sum = tf.Summary(value=[tf.Summary.Value(tag="model/loss", simple_value=np.mean(dev_loss))])
+                writer.add_summary(dev_loss_sum, global_step)
+                writer.flush()
+

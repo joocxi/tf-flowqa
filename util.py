@@ -25,15 +25,15 @@ def get_parser(config):
 
         context_idxs = tf.reshape(tf.decode_raw(features["context_idxs"], tf.int32), [para_limit])
         questions_idxs = tf.reshape(tf.decode_raw(features["questions_idxs"], tf.int32), [turn_limit, ques_limit])
-        context_char_idxs = tf.reshape(tf.decode_raw(features["context_char_idxs"], tf.int32), [para_limit, max_char_length])
-        questions_char_idxs = tf.reshape(tf.decode_raw(features["questions_char_idxs"], tf.int32), [turn_limit, ques_limit, max_char_length])
-        starts = tf.reshape(tf.decode_raw(features["starts"], tf.int32), [turn_limit, para_limit])
-        ends = tf.reshape(tf.decode_raw(features["ends"], tf.int32), [turn_limit, para_limit])
+        context_char_idxs = tf.reshape(tf.decode_raw(features["context_char_idxs"], tf.int32), [para_limit + 2, max_char_length])
+        questions_char_idxs = tf.reshape(tf.decode_raw(features["questions_char_idxs"], tf.int32), [turn_limit, ques_limit + 2, max_char_length])
+        starts = tf.reshape(tf.decode_raw(features["starts"], tf.float32), [turn_limit, para_limit])
+        ends = tf.reshape(tf.decode_raw(features["ends"], tf.float32), [turn_limit, para_limit])
         em = tf.reshape(tf.decode_raw(features["em"], tf.int32), [turn_limit, para_limit])
         yes_answers = tf.reshape(tf.decode_raw(features["yes_answers"], tf.int32), [turn_limit])
         no_answers = tf.reshape(tf.decode_raw(features["no_answers"], tf.int32), [turn_limit])
         unk_answers = tf.reshape(tf.decode_raw(features["unk_answers"], tf.int32), [turn_limit])
-        span_flag = tf.decode_raw(features["span_flag"])
+        span_flag = tf.reshape(tf.decode_raw(features["span_flag"], tf.int32), [turn_limit])
         return context_idxs, questions_idxs, context_char_idxs, questions_char_idxs, \
             starts, ends, em, yes_answers, no_answers, unk_answers, span_flag
     return parse    
@@ -49,4 +49,5 @@ def get_train_dataset(record_file, parser, config):
 def get_dev_dataset(record_file, parser, config):
     dataset = tf.data.TFRecordDataset(record_file).map(
         parser).shuffle(config.capacity).repeat()
+    dataset = dataset.batch(config.batch_size)
     return dataset
